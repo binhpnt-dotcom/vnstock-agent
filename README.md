@@ -74,7 +74,44 @@ vnstock-agent funds
 
 # JSON output
 vnstock-agent --format json history VNM
+
+# FO Market Scorecard (Polo) — cycle phase & allocation dashboard
+vnstock-agent scorecard update data/scorecard/FO_Market_Scorecard_Polo_OneSheet_v5.xlsx \
+  --dashboard docs/scorecard/index.html
 ```
+
+## Market Scorecard (Cycle & Allocation)
+
+`vnstock-agent scorecard update FILE` fetches live VN market data via vnstock,
+recomputes the "Market_Scorecard_Polo" workbook's cycle/allocation formulas
+in Python, writes the fetched values back into the workbook (formulas are
+left untouched so it still recalculates if opened in Excel/Sheets), and can
+render a standalone HTML dashboard.
+
+Auto-updated every run: VNIndex spot, 20D/6M avg liquidity, MA50/MA200, RSI14,
+VN30-basket breadth (% above MA50/MA200, a proxy for full-market breadth),
+BTC 30D ROC, and the USD/VND rate. Everything else (valuation table, macro
+series, margin/ETF flow, sentiment/news/FDI) has no vnstock data source and
+stays a manual weekly input, per the sheet's own Notes/Frequency columns.
+
+```bash
+vnstock-agent scorecard update path/to/scorecard.xlsx \
+  --dashboard path/to/dashboard.html \
+  [--out path/to/other-file.xlsx] [--skip-breadth]
+```
+
+A scheduled GitHub Actions workflow (`.github/workflows/scorecard-update.yml`)
+runs this on weekday mornings against `data/scorecard/FO_Market_Scorecard_Polo_OneSheet_v5.xlsx`
+and commits the refreshed workbook + `docs/scorecard/index.html`. Set the
+`VNSTOCK_API_KEY` repo secret for it to run, and enable GitHub Pages on
+`docs/` if you want the dashboard served as a URL.
+
+Note: the tool flags two data-integrity issues it found in the original
+workbook (cell `E8` holds text instead of a numeric weight, so the
+CyclePsych group score doesn't count toward the Overall Market Score; and
+row 27's group label has a trailing space so it's excluded from the Flow
+group score) — see the CLI/dashboard output for details rather than a
+silent "fix."
 
 ## MCP Server
 

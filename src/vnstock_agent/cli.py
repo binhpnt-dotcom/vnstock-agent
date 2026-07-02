@@ -7,6 +7,7 @@ import click
 
 from vnstock_agent import core
 from vnstock_agent.config import DEFAULT_SOURCE
+from vnstock_agent import scorecard as _scorecard
 
 
 def _output(data, output_format: str):
@@ -274,6 +275,44 @@ def funds(ctx):
     """Get list of open-ended mutual funds."""
     data = core.fund_listing()
     _output(data, ctx.obj["format"])
+
+
+# --- Scorecard commands ---
+
+
+@main.group()
+def scorecard():
+    """FO Market Scorecard (Polo) automation: cycle phase & allocation."""
+
+
+@scorecard.command("update")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--out", "-o", default=None, help="Write updated workbook to a different path (default: overwrite FILE)")
+@click.option("--dashboard", "-d", default=None, help="Path to write an HTML dashboard summary")
+@click.option("--source", default=DEFAULT_SOURCE, help="Data source: VCI or KBS")
+@click.option("--skip-breadth", is_flag=True, help="Skip VN30 market-breadth fetch (faster, ~30 fewer API calls)")
+def scorecard_update(file, out, dashboard, source, skip_breadth):
+    """Fetch live VN market data and recompute cycle/allocation in the scorecard workbook."""
+    result, auto, applied = _scorecard.update_workbook(
+        file, out_path=out, source=source, include_breadth=not skip_breadth
+    )
+    click.echo(f"Overall Market Score: {result.overall_score:.1f}  ({result.stance})")
+    click.echo(f"Cycle Phase: {result.cycle_phase}  (sentiment={result.sentiment_regime}, macro={result.macro_regime})")
+    click.echo(f"Suggested Equity Weight: {result.suggested_equity_weight:.1%}  (leverage: {result.leverage_note})")
+    click.echo(f"Auto-updated fields: {', '.join(applied) if applied else 'none'}")
+    if auto.errors:
+        click.echo("Fetch issues:")
+        for k, v in auto.errors.items():
+            click.echo(f"  - {k}: {v}")
+    if result.warnings:
+        stale = [w for w in result.warnings if w not in auto.errors.values()]
+        if stale:
+            click.echo("Detected issues in the source workbook:")
+            for w in stale:
+                click.echo(f"  - {w}")
+    if dashboard:
+        _scorecard.write_dashboard(result, auto, applied, dashboard)
+        click.echo(f"Dashboard written to {dashboard}")
 
 
 # --- MCP server command ---

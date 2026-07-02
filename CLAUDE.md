@@ -12,11 +12,18 @@ Single Python package with 2 entry points:
 
 ```
 src/vnstock_agent/
-├── config.py   # Settings, API key management
-├── core.py     # Shared vnstock wrapper (DataFrame→dict)
-├── server.py   # FastMCP server with 21 tools
-└── cli.py      # Click CLI with 22 commands
+├── config.py     # Settings, API key management
+├── core.py       # Shared vnstock wrapper (DataFrame→dict)
+├── server.py     # FastMCP server with 21 tools
+├── cli.py        # Click CLI with 22 commands + scorecard group
+└── scorecard.py  # FO Market Scorecard (Polo) engine: fetch, recompute, dashboard
 ```
+
+`scorecard.py` replicates the "Market_Scorecard_Polo" Excel workbook's formulas in
+Python (verified cell-by-cell against the workbook's cached values — see
+`tests/test_scorecard_engine.py`), fetches the technical inputs it can reliably
+source from vnstock, writes them back into the workbook's raw cells, and renders
+an HTML dashboard. `.github/workflows/scorecard-update.yml` runs it on a schedule.
 
 ## Commands
 
