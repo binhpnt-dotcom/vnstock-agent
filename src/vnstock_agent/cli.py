@@ -315,6 +315,29 @@ def scorecard_update(file, out, dashboard, source, skip_breadth):
         click.echo(f"Dashboard written to {dashboard}")
 
 
+@scorecard.command("checklist")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+def scorecard_checklist(file):
+    """List which indicators need manual weekly/monthly/quarterly updates (no network calls)."""
+    _, ws = _scorecard.load_workbook_sheet(file)
+    base = _scorecard.read_base_inputs(ws)
+    result = _scorecard.compute(ws, base, _scorecard.AutoData())
+    checklist = _scorecard.manual_update_checklist(result.rows)
+    for freq in ("Weekly", "Monthly", "Quarterly"):
+        items = checklist.get(freq, [])
+        click.echo(f"\n{freq} ({len(items)}):")
+        for r in items:
+            click.echo(f"  - [{r.group.strip()}] {r.factor}")
+    other = checklist.get("Other", [])
+    if other:
+        click.echo(f"\nOther ({len(other)}):")
+        for r in other:
+            click.echo(f"  - [{r.group.strip()}] {r.factor}")
+    auto_count = sum(1 for r in result.rows if r.source == "auto")
+    manual_count = sum(len(v) for v in checklist.values())
+    click.echo(f"\n{auto_count} indicators are auto-updated by 'scorecard update'; {manual_count} need manual input.")
+
+
 # --- MCP server command ---
 
 

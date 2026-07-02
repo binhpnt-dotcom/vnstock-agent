@@ -4,31 +4,39 @@ This module drives the "Market_Scorecard_Polo" Excel workbook: it fetches
 live VN market data via vnstock, recomputes the scorecard's formulas in
 pure Python (so cycle phase / allocation numbers are available without
 opening Excel), writes the fetched inputs back into the workbook's raw
-input cells (leaving every formula untouched so the file still recalculates
-correctly if opened in Excel/Sheets/LibreOffice), and renders an HTML
+input cells via a surgical XML patch (see `patch_workbook_cells` — NOT an
+openpyxl load-then-save round trip, which silently drops this workbook's
+embedded reference chart and threaded comments), and renders an HTML
 dashboard.
 
 The formula replication below was verified cell-by-cell against the cached
 values embedded in the original workbook (P/E z-score, group scores,
 overall score, stance, suggested equity weight, allocation table, cycle
 phase, etc. all matched to float precision). Two latent issues were found
-in the original sheet during that verification and are surfaced here as
-`ScorecardResult.warnings` rather than silently "fixed":
+in the original sheet during that verification and have been fixed in the
+template (`data/scorecard/FO_Market_Scorecard_Polo_OneSheet_v5.xlsx`):
 
-1. Cell E8 holds the text "Macro Regime" (a stray table header) instead of
-   a numeric weight, even though the Overall Market Score formula
+1. Cell E8 held the text "Macro Regime" (a stray table header) instead of a
+   numeric weight, even though the Overall Market Score formula
    (`=SUMPRODUCT(B53:B57,E4:E8)`) multiplies it against the CyclePsych
-   group score. A non-numeric operand contributes 0, so the CyclePsych
-   group is silently excluded from the Overall Market Score even though it
-   still drives Sentiment Regime / Cycle Phase.
-2. Row 27's Group label is `"Flow "` (trailing space) instead of `"Flow"`,
-   so `SUMIF(A17:A49,"Flow",...)` excludes it — "Liquidity vs 6M avg" does
-   not contribute to the Flow group score.
+   group score — silently excluding CyclePsych from the Overall Score even
+   though it still drives Sentiment Regime / Cycle Phase. Fixed to E8=0
+   (an explicit, documented choice — see `ScorecardResult.notes` — rather
+   than a numeric weight, since folding CyclePsych into the score changes
+   Stance/Allocation output and is a call only the sheet's owner should make).
+2. Row 27's Group label was `"Flow "` (trailing space) instead of `"Flow"`,
+   so `SUMIF(A17:A49,"Flow",...)` excluded it. Fixed to `"Flow"`; group
+   matching in `_group_score` is also whitespace-tolerant now so this class
+   of bug can't recur silently.
+
+Any row whose Group label still doesn't match one of the five known groups
+after stripping whitespace is surfaced in `ScorecardResult.warnings`.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -46,8 +54,13 @@ INDICATOR_ROWS = range(17, 50)  # rows 17-49 inclusive
 GROUPS = ["Value", "Technical", "Flow", "Macro", "CyclePsych"]
 
 # Rows whose CurrentValue (col C) formula we recompute ourselves from base
-# inputs instead of treating as a manual entry.
-_DERIVED_ROWS = {17, 18, 19, 20, 21, 25, 26, 27, 33, 39, 44}
+# inputs instead of treating as a manual entry. Split by whether that
+# formula's inputs are themselves auto-fetched (B4/B5/B7/H10/H11/I10/I9) or
+# manual (the valuation table C14/D14/C15/D15/I14/I15/H12) — this drives the
+# "auto" vs "manual" tag shown in the dashboard's update checklist.
+_DERIVED_AUTO_ROWS = {25, 26, 27, 33, 39}  # Index/MA50, MA50 slope, Liq/6M avg, 20D liq, FX YTD
+_DERIVED_MANUAL_ROWS = {17, 18, 19, 20, 21, 44}  # P/E & P/B z-scores, PEG, ROE, CoE
+_DERIVED_ROWS = _DERIVED_AUTO_ROWS | _DERIVED_MANUAL_ROWS
 # Rows whose CurrentValue we overwrite with live market data.
 _AUTO_ROWS = {22, 23, 24, 47}
 _SAFE_ARITHMETIC_RE = re.compile(r"^[0-9.\s+\-*/()]+$")
@@ -100,7 +113,8 @@ class IndicatorRow:
     good: float
     bad: float
     lower_is_better: bool
-    source: str  # "auto" | "derived" | "manual"
+    frequency: str  # "Weekly" | "Monthly" | "Quarterly" (from the sheet's own Frequency column)
+    source: str  # "auto" | "manual"
     score10: float = 0.0
     score100: float = 0.0
 
@@ -159,7 +173,8 @@ class ScorecardResult:
     allocation: list  # list[dict]
     narrative: str
     liquidity_band: str
-    warnings: list
+    warnings: list  # data-quality problems (wrong types, unmatched labels, fetch failures)
+    notes: list  # informational context, not problems (e.g. an intentional 0 weight)
 
 
 # --- Reading the workbook -------------------------------------------------
@@ -174,6 +189,7 @@ def _read_row_meta(ws, row: int) -> dict:
         good=_num(ws[f"H{row}"].value),
         bad=_num(ws[f"I{row}"].value),
         lower_is_better=(ws[f"J{row}"].value == 1),
+        frequency=ws[f"L{row}"].value or "",
     )
 
 
@@ -432,15 +448,22 @@ def build_rows(ws, base: BaseInputs, auto: AutoData) -> list:
     rows = []
     for r in INDICATOR_ROWS:
         meta = _read_row_meta(ws, r)
-        if r in _DERIVED_ROWS:
+        if r in _DERIVED_AUTO_ROWS:
             current = _derived_current(r, base, {})
-            source_tag = "derived"
-        elif r in _AUTO_ROWS and auto_map.get(r) is not None:
-            current = auto_map[r]
+            source_tag = "auto"
+        elif r in _DERIVED_MANUAL_ROWS:
+            current = _derived_current(r, base, {})
+            source_tag = "manual"
+        elif r in _AUTO_ROWS:
+            # Always "auto": these are machine-derived (RSI/breadth/BTC ROC), never something a
+            # human types into CurrentValue. If this run didn't fetch live data (or the fetch
+            # failed), we fall back to whatever value is already in the cell, but that's a
+            # staleness concern surfaced via AutoData.errors — not a manual-entry checklist item.
+            current = auto_map[r] if auto_map.get(r) is not None else _num(ws[f"C{r}"].value)
             source_tag = "auto"
         else:
             current = _num(ws[f"C{r}"].value)
-            source_tag = "manual" if r not in _AUTO_ROWS else "manual (auto-fetch unavailable)"
+            source_tag = "manual"
         score10 = _score10(meta, current)
         rows.append(
             IndicatorRow(
@@ -452,6 +475,7 @@ def build_rows(ws, base: BaseInputs, auto: AutoData) -> list:
                 good=meta["good"],
                 bad=meta["bad"],
                 lower_is_better=meta["lower_is_better"],
+                frequency=meta["frequency"],
                 source=source_tag,
                 score10=score10,
                 score100=score10 * 10,
@@ -461,7 +485,11 @@ def build_rows(ws, base: BaseInputs, auto: AutoData) -> list:
 
 
 def _group_score(rows: list, group: str) -> float:
-    items = [r for r in rows if r.group == group]
+    """Weighted average score for a group. Matches on the stripped group
+    label so stray whitespace in a row's Group cell (A17:A49) can't silently
+    exclude it — a real bug found in the original workbook (row 27 was
+    'Flow ' with a trailing space)."""
+    items = [r for r in rows if isinstance(r.group, str) and r.group.strip() == group]
     wsum = sum(r.weight for r in items)
     if wsum == 0:
         return 0.0
@@ -485,6 +513,23 @@ def _liquidity_band(liq_20d: float) -> str:
         if liq_20d <= threshold:
             return label
     return ">40k"
+
+
+_FREQUENCY_ORDER = ["Weekly", "Monthly", "Quarterly"]
+
+
+def manual_update_checklist(rows: list) -> dict:
+    """Manual-source indicators, grouped by the sheet's own Frequency column
+    (L17:L49), in Weekly -> Monthly -> Quarterly order (plus "Other" for any
+    row whose Frequency cell doesn't match one of those three). Auto-fetched /
+    auto-derived rows are excluded since nothing needs to be typed in for them."""
+    checklist = {freq: [] for freq in _FREQUENCY_ORDER}
+    for r in sorted(rows, key=lambda x: x.row):
+        if r.source != "manual":
+            continue
+        freq = r.frequency if r.frequency in checklist else "Other"
+        checklist.setdefault(freq, []).append(r)
+    return checklist
 
 
 def _macro_regime(rows: list) -> str:
@@ -527,26 +572,39 @@ def _cycle_phase(liq_20d: float, sentiment: str, macro: str, adr: float) -> str:
 
 def compute(ws, base: BaseInputs, auto: AutoData) -> ScorecardResult:
     warns = list(auto.errors.values())
+    notes = []
 
     rows = build_rows(ws, base, auto)
     group_scores = {g: _group_score(rows, g) for g in GROUPS}
 
     cyclepsych_weight_raw = base.group_weight["CyclePsych"]
-    cyclepsych_weight = cyclepsych_weight_raw if isinstance(cyclepsych_weight_raw, (int, float)) else 0.0
-    if not isinstance(cyclepsych_weight_raw, (int, float)):
+    if isinstance(cyclepsych_weight_raw, (int, float)):
+        cyclepsych_weight = cyclepsych_weight_raw
+        if cyclepsych_weight == 0:
+            notes.append(
+                "E8 (CyclePsych's weight in the Overall Market Score) is set to 0: CyclePsych "
+                "stays a qualitative overlay (Sentiment Regime, Cycle Phase) rather than a scored "
+                "input, so Overall Score is Value 35% + Technical 20% + Flow 20% + Macro 25%. "
+                "Set E8 to a non-zero number (and rebalance the other four so they still sum to "
+                "1.0) if you want it to count toward the score directly."
+            )
+    else:
+        cyclepsych_weight = 0.0
         warns.append(
             f"Cell E8 holds {cyclepsych_weight_raw!r} (not a number). The Overall Market Score "
             "formula multiplies it by the CyclePsych group score, so CyclePsych is currently "
             "contributing 0% to the Overall Score even though it still drives Sentiment Regime / "
             "Cycle Phase. Put a numeric weight in E8 if that group should count toward the score."
         )
-    flow_row27 = next((r for r in rows if r.row == 27), None)
-    if flow_row27 and flow_row27.group != "Flow":
-        warns.append(
-            f"Row 27's Group cell (A27) is {flow_row27.group!r} instead of \"Flow\", so "
-            "'Liquidity vs 6M avg (ratio)' is excluded from the Flow group score (Excel's "
-            "SUMIF only matches exact text)."
-        )
+
+    # Any row whose Group label doesn't cleanly match one of the five known
+    # groups (after stripping whitespace) is a genuine data problem — scoring
+    # itself is whitespace-tolerant (see _group_score), so this only fires on
+    # real typos, not the specific "Flow " bug found in the original sheet.
+    for r in rows:
+        stripped = r.group.strip() if isinstance(r.group, str) else r.group
+        if stripped not in GROUPS:
+            warns.append(f"Row {r.row}'s Group cell (A{r.row}) is {r.group!r}, not one of {GROUPS} — excluded from scoring.")
 
     overall_score = (
         group_scores["Value"] * base.group_weight["Value"]
@@ -630,11 +688,11 @@ def compute(ws, base: BaseInputs, auto: AutoData) -> ScorecardResult:
         narrative=narrative,
         liquidity_band=_liquidity_band(base.liq_20d),
         warnings=warns,
+        notes=notes,
     )
 
 
 # --- Workbook I/O ------------------------------------------------------------
-
 
 _AUTO_FIELD_CELLS = {
     "vnindex_spot": CELL_VNINDEX_SPOT,
@@ -650,19 +708,19 @@ _AUTO_FIELD_CELLS = {
     "fx_today": CELL_FX_TODAY,
 }
 
-
-def apply_auto_data(ws, auto: AutoData) -> list:
-    """Write fetched values into the workbook's raw input cells (formulas
-    elsewhere are left untouched). Returns the list of fields actually applied."""
-    applied = []
-    for field_name, cell in _AUTO_FIELD_CELLS.items():
-        value = getattr(auto, field_name)
-        if value is not None:
-            ws[cell] = value
-            applied.append(field_name)
-    ws[CELL_LAST_UPDATED] = datetime.now()
-    ws[CELL_AS_OF_DATE] = datetime.now().strftime("%Y-%m-%d")
-    return applied
+# Auto fields that also feed BaseInputs (so downstream derived-formula rows —
+# C25/C26/C27/C33/C39 — see the fresh values). rsi14/pct_above_ma50/
+# pct_above_ma200/btc_roc_30d aren't BaseInputs fields; they're consumed
+# directly by build_rows() via the AutoData object.
+_AUTO_FIELD_TO_BASE_ATTR = {
+    "vnindex_spot": "vnindex_spot",
+    "liq_20d": "liq_20d",
+    "liq_6m_avg": "liq_6m_avg",
+    "ma50": "ma50",
+    "ma200": "ma200",
+    "ma50_20d_ago": "ma50_20d_ago",
+    "fx_today": "fx_today",
+}
 
 
 def load_workbook_sheet(path: str):
@@ -674,6 +732,24 @@ def load_workbook_sheet(path: str):
     return wb, ws
 
 
+def _apply_auto_to_base(base: BaseInputs, auto: AutoData) -> tuple:
+    """Return (new_base, applied_field_names) with fetched values overlaid
+    onto the base inputs, without touching the workbook on disk."""
+    import dataclasses
+
+    overrides = {}
+    applied = []
+    for auto_field, base_attr in _AUTO_FIELD_TO_BASE_ATTR.items():
+        value = getattr(auto, auto_field)
+        if value is not None:
+            overrides[base_attr] = value
+            applied.append(auto_field)
+    for auto_field in ("rsi14", "pct_above_ma50", "pct_above_ma200", "btc_roc_30d"):
+        if getattr(auto, auto_field) is not None:
+            applied.append(auto_field)
+    return dataclasses.replace(base, **overrides), applied
+
+
 def update_workbook(
     path: str,
     out_path: Optional[str] = None,
@@ -682,18 +758,167 @@ def update_workbook(
 ) -> tuple:
     """Fetch live data, recompute the scorecard, write it back to the workbook.
 
+    The write uses `patch_workbook_cells` (surgical XML edit of just the
+    changed cells) rather than an openpyxl load-then-save round trip: this
+    workbook has an embedded reference chart and threaded comments that
+    openpyxl does not round-trip, and since this file gets rewritten on a
+    recurring schedule a lossy save would silently destroy them every run.
+
     Returns (ScorecardResult, AutoData, applied_fields).
     """
-    wb, ws = load_workbook_sheet(path)
+    _wb, ws = load_workbook_sheet(path)
     auto = fetch_auto_data(source=source, include_breadth=include_breadth)
-    applied = apply_auto_data(ws, auto)
 
-    # Re-read base inputs after writing so derived formulas use fresh values.
     base = read_base_inputs(ws)
+    base, applied = _apply_auto_to_base(base, auto)
     result = compute(ws, base, auto)
 
-    wb.save(out_path or path)
+    numeric_updates = {_AUTO_FIELD_CELLS[f]: getattr(auto, f) for f in applied}
+    numeric_updates[CELL_LAST_UPDATED] = _excel_serial(datetime.now())
+    string_updates = {CELL_AS_OF_DATE: datetime.now().strftime("%Y-%m-%d")}
+
+    patch_workbook_cells(path, out_path or path, numeric_updates, string_updates)
     return result, auto, applied
+
+
+# --- Surgical XML cell patching (preserves everything else byte-for-byte) --
+
+_COL_RE = re.compile(r"^([A-Z]+)(\d+)$")
+
+
+def _col_row(ref: str) -> tuple:
+    m = _COL_RE.match(ref)
+    if not m:
+        raise ValueError(f"not a cell reference: {ref!r}")
+    return m.group(1), int(m.group(2))
+
+
+def _col_to_num(col: str) -> int:
+    n = 0
+    for ch in col:
+        n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n
+
+
+def _cell_regex(ref: str) -> re.Pattern:
+    return re.compile(r'<c r="' + re.escape(ref) + r'"((?:\s+[\w:]+="[^"]*")*)\s*(/>|>.*?</c>)', re.DOTALL)
+
+
+def _strip_type_attr(attrs: str) -> str:
+    return re.sub(r'\s*t="[^"]*"', "", attrs)
+
+
+def _insert_cell(xml: str, ref: str, cell_xml: str) -> str:
+    """Insert a brand-new <c> node into its row (in column order), for a
+    cell reference that doesn't exist in the sheet XML yet."""
+    col, row_num = _col_row(ref)
+    col_num = _col_to_num(col)
+    row_pattern = re.compile(r'(<row r="' + str(row_num) + r'"[^>]*>)(.*?)(</row>)', re.DOTALL)
+    m = row_pattern.search(xml)
+    if not m:
+        raise ValueError(f"row {row_num} not found in sheet XML")
+    inner = m.group(2)
+    insert_at = len(inner)
+    for cm in re.finditer(r'<c r="([A-Z]+)\d+"', inner):
+        if _col_to_num(cm.group(1)) > col_num:
+            insert_at = cm.start()
+            break
+    new_inner = inner[:insert_at] + cell_xml + inner[insert_at:]
+    return xml[: m.start(2)] + new_inner + xml[m.end(2) :]
+
+
+def _set_numeric_cell(xml: str, ref: str, value: float) -> str:
+    m = _cell_regex(ref).search(xml)
+    if not m:
+        raise ValueError(f"cell {ref} not found in sheet XML")
+    attrs = _strip_type_attr(m.group(1))
+    new_cell = f"<c r=\"{ref}\"{attrs}><v>{value!r}</v></c>"
+    return xml[: m.start()] + new_cell + xml[m.end() :]
+
+
+def _set_or_insert_inline_string(xml: str, ref: str, text: str) -> str:
+    import html as _html
+
+    escaped = _html.escape(text, quote=False)
+    m = _cell_regex(ref).search(xml)
+    if m:
+        attrs = _strip_type_attr(m.group(1))
+        new_cell = f'<c r="{ref}"{attrs} t="inlineStr"><is><t>{escaped}</t></is></c>'
+        return xml[: m.start()] + new_cell + xml[m.end() :]
+    return _insert_cell(xml, ref, f'<c r="{ref}" t="inlineStr"><is><t>{escaped}</t></is></c>')
+
+
+def _excel_serial(dt: datetime) -> float:
+    epoch = datetime(1899, 12, 30)
+    delta = dt - epoch
+    return delta.days + delta.seconds / 86400
+
+
+def patch_workbook_cells(
+    path: str,
+    out_path: str,
+    numeric_updates: Optional[dict] = None,
+    string_updates: Optional[dict] = None,
+    sheet_name: str = SHEET_NAME,
+) -> None:
+    """Update specific cells in an .xlsx by editing its worksheet XML
+    directly inside the zip archive, leaving every other part (embedded
+    images, threaded comments, styles, tables, formulas elsewhere) exactly
+    as it was. An openpyxl load-then-save round trip is NOT equivalent here:
+    it silently drops this workbook's embedded reference chart image and
+    degrades threaded comments to legacy ones.
+    """
+    import shutil
+    import tempfile
+    import zipfile
+
+    numeric_updates = numeric_updates or {}
+    string_updates = string_updates or {}
+
+    with zipfile.ZipFile(path, "r") as zin:
+        workbook_xml = zin.read("xl/workbook.xml").decode("utf-8")
+        rels_xml = zin.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+
+        sheet_match = re.search(r'<sheet name="' + re.escape(sheet_name) + r'"[^>]*r:id="([^"]+)"', workbook_xml)
+        if not sheet_match:
+            raise ValueError(f"sheet {sheet_name!r} not found in xl/workbook.xml")
+        rid = sheet_match.group(1)
+        rel_match = re.search(r'<Relationship Id="' + re.escape(rid) + r'"[^>]*Target="([^"]+)"', rels_xml)
+        if not rel_match:
+            raise ValueError(f"relationship {rid} not found in xl/_rels/workbook.xml.rels")
+        sheet_path = "xl/" + rel_match.group(1)
+
+        sheet_xml = zin.read(sheet_path).decode("utf-8")
+        for ref, value in numeric_updates.items():
+            sheet_xml = _set_numeric_cell(sheet_xml, ref, value)
+        for ref, text in string_updates.items():
+            sheet_xml = _set_or_insert_inline_string(sheet_xml, ref, text)
+
+        # We edited cached input values without recalculating dependent
+        # formulas ourselves, so force Excel to fully recalculate on next open.
+        if "<calcPr" in workbook_xml:
+            workbook_xml_patched = re.sub(r"<calcPr[^/]*/>", '<calcPr calcId="0" fullCalcOnLoad="1"/>', workbook_xml)
+        else:
+            workbook_xml_patched = workbook_xml.replace(
+                "</workbook>", '<calcPr calcId="0" fullCalcOnLoad="1"/></workbook>'
+            )
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(tmp_fd)
+        try:
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    if item.filename == sheet_path:
+                        data = sheet_xml.encode("utf-8")
+                    elif item.filename == "xl/workbook.xml":
+                        data = workbook_xml_patched.encode("utf-8")
+                    else:
+                        data = zin.read(item.filename)
+                    zout.writestr(item, data)
+            shutil.move(tmp_path, out_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
 
 # --- HTML dashboard rendering ------------------------------------------------
@@ -795,11 +1020,23 @@ def render_dashboard_html(
 
     errors_html = "".join(f"<li>{_esc(msg)}</li>" for msg in auto.errors.values())
     warnings_html = "".join(f"<li>{_esc(w)}</li>" for w in result.warnings if w not in auto.errors.values())
+    notes_html = "".join(f"<li>{_esc(n)}</li>" for n in result.notes)
+
+    checklist = manual_update_checklist(result.rows)
+    checklist_cols = ""
+    for freq in _FREQUENCY_ORDER:
+        items = checklist.get(freq, [])
+        items_html = "".join(f"<li>{_esc(r.factor)}</li>" for r in items) or "<li>None — fully auto-updated.</li>"
+        checklist_cols += f"""
+        <div>
+          <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;font-weight:600;">{freq} ({len(items)})</div>
+          <ul>{items_html}</ul>
+        </div>"""
 
     indicator_rows_html = ""
     for r in sorted(result.rows, key=lambda x: x.row):
-        source_class = {"auto": "tag-auto", "derived": "tag-derived"}.get(r.source, "tag-manual")
-        source_label = {"auto": "auto", "derived": "derived"}.get(r.source, "manual")
+        source_class = "tag-auto" if r.source == "auto" else "tag-manual"
+        source_label = "auto" if r.source == "auto" else "manual"
         indicator_rows_html += f"""
         <tr>
           <td><span class="dot" style="background:{_GROUP_COLORS.get(r.group.strip(), '#898781')}"></span>{_esc(r.group)}</td>
@@ -877,7 +1114,8 @@ def render_dashboard_html(
   ul {{ margin: 0; padding-left: 20px; font-size: 13px; color: var(--text-secondary); line-height: 1.6; }}
   .warn-list li {{ color: #9a5b00; }}
   .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
-  @media (max-width: 640px) {{ .two-col {{ grid-template-columns: 1fr; }} }}
+  .three-col {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }}
+  @media (max-width: 640px) {{ .two-col, .three-col {{ grid-template-columns: 1fr; }} }}
 </style>
 </head>
 <body>
@@ -922,19 +1160,16 @@ def render_dashboard_html(
   </div>
 
   <div class="card">
-    <h2>Data freshness</h2>
-    <div class="two-col">
-      <div>
-        <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;font-weight:600;">Auto-updated this run</div>
-        <ul>{auto_list_html}</ul>
-      </div>
-      <div>
-        <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;font-weight:600;">Needs manual weekly input</div>
-        <ul>Valuation table, macro (GDP/credit/SBV/rates/CPI), margin &amp; ETF flow, sentiment/news/FDI — see the sheet's own Notes/Frequency columns for sources (Vietcap IQ, TCBS, VBMA, Fiintrade, Topi).</ul>
-      </div>
-    </div>
+    <h2>Auto-updated this run</h2>
+    <ul>{auto_list_html}</ul>
     {f'<div style="margin-top:12px;font-size:12px;color:var(--text-muted);font-weight:600;">Fetch issues this run</div><ul>{errors_html}</ul>' if errors_html else ''}
     {f'<div style="margin-top:12px;font-size:12px;color:var(--text-muted);font-weight:600;">Detected issues in the source workbook</div><ul class="warn-list">{warnings_html}</ul>' if warnings_html else ''}
+    {f'<div style="margin-top:12px;font-size:12px;color:var(--text-muted);font-weight:600;">Notes</div><ul>{notes_html}</ul>' if notes_html else ''}
+  </div>
+
+  <div class="card">
+    <h2>Manual update checklist ({sum(len(v) for v in checklist.values())} indicators — sources: Vietcap IQ, TCBS, VBMA, Fiintrade, Topi)</h2>
+    <div class="three-col">{checklist_cols}</div>
   </div>
 
   <div class="card">

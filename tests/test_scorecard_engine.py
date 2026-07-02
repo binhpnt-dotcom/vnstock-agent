@@ -1,10 +1,13 @@
 """Regression tests for the scorecard calc engine.
 
-These check the pure-Python formula replication in `vnstock_agent.scorecard`
-against the cached values embedded in the original workbook by whatever
-spreadsheet engine last computed it — i.e. they confirm `compute()` produces
-byte-for-byte the same Group Scores / Overall Score / Stance / Cycle Phase /
-Allocation numbers Excel would, given the same inputs and no live data fetch.
+The template workbook (`data/scorecard/FO_Market_Scorecard_Polo_OneSheet_v5.xlsx`)
+had two data-quality bugs when it was first verified against Excel's own
+cached values: cell E8 held text ("Macro Regime") instead of a numeric
+CyclePsych weight, and row 27's Group label was "Flow " (trailing space),
+excluding it from the Flow group score. Both have since been fixed in the
+fixture (E8=0, A27="Flow") — see `test_detects_known_sheet_issues` below for
+the values this produces, and `_group_score`'s docstring in scorecard.py for
+why group matching is whitespace-tolerant regardless.
 """
 
 from pathlib import Path
@@ -26,13 +29,14 @@ def result():
 def test_group_scores(result):
     assert result.group_scores["Value"] == pytest.approx(67.81666666666666)
     assert result.group_scores["Technical"] == pytest.approx(46.71615906855472)
-    assert result.group_scores["Flow"] == pytest.approx(56.73555800784733)
+    assert result.group_scores["Flow"] == pytest.approx(54.34109792142938)
     assert result.group_scores["Macro"] == pytest.approx(78.89145106861635)
     assert result.group_scores["CyclePsych"] == pytest.approx(68.40942028985505)
 
 
 def test_overall_score_and_stance(result):
-    assert result.overall_score == pytest.approx(64.14903951576783)
+    # CyclePsych weight (E8) is 0, so Overall Score = Value*.35 + Technical*.2 + Flow*.2 + Macro*.25
+    assert result.overall_score == pytest.approx(63.67014749848424)
     assert result.stance == "Trung tính (giữ barbell)"
 
 
@@ -43,7 +47,7 @@ def test_regimes_and_cycle_phase(result):
 
 
 def test_suggested_equity_weight_and_leverage(result):
-    assert result.suggested_equity_weight == pytest.approx(0.9237461690270566)
+    assert result.suggested_equity_weight == pytest.approx(0.916850123978173)
     assert result.leverage_note == "zero"
 
 
@@ -52,10 +56,10 @@ def test_allocation_table(result):
     assert by_layer["Core Compounders (C)"]["pct_equity"] == pytest.approx(0.6)
     assert by_layer["Growth Catalysts (G)"]["pct_equity"] == pytest.approx(0.25)
     assert by_layer["Lynch/Fisher Layer (L)"]["pct_equity"] == pytest.approx(0.15)
-    assert by_layer["Core Compounders (C)"]["pct_nav"] == pytest.approx(0.5542477014162339)
-    assert by_layer["Growth Catalysts (G)"]["pct_nav"] == pytest.approx(0.23093654225676416)
-    assert by_layer["Lynch/Fisher Layer (L)"]["pct_nav"] == pytest.approx(0.1385619253540585)
-    assert by_layer["Cash / Defensive"]["pct_nav"] == pytest.approx(0.07625383097294336)
+    assert by_layer["Core Compounders (C)"]["pct_nav"] == pytest.approx(0.5501100743869037)
+    assert by_layer["Growth Catalysts (G)"]["pct_nav"] == pytest.approx(0.22921253099454325)
+    assert by_layer["Lynch/Fisher Layer (L)"]["pct_nav"] == pytest.approx(0.13752751859672596)
+    assert by_layer["Cash / Defensive"]["pct_nav"] == pytest.approx(0.083149876021827)
 
 
 def test_narrative(result):
@@ -63,12 +67,23 @@ def test_narrative(result):
 
 
 def test_detects_known_sheet_issues(result):
-    """The original workbook has two latent bugs (non-numeric E8 weight, and
-    a trailing space on row 27's group label) that this engine surfaces
-    instead of silently working around."""
-    joined = " ".join(result.warnings)
-    assert "E8" in joined
-    assert "Row 27" in joined
+    """Both bugs are fixed in the fixture, so there should be no warnings —
+    but E8=0 is surfaced as an informational note, not a silent no-op."""
+    assert result.warnings == []
+    assert any("E8" in n for n in result.notes)
+
+
+def test_group_matching_is_whitespace_tolerant():
+    """Regression guard for the original 'Flow ' bug: a stray space in a
+    row's Group cell must not silently exclude it from its group score."""
+    Row = sc.IndicatorRow
+    rows = [
+        Row(row=1, group="Flow ", factor="a", current=1, weight=1, good=0, bad=10,
+            lower_is_better=True, frequency="Weekly", source="manual", score10=5, score100=50),
+        Row(row=2, group="Flow", factor="b", current=1, weight=1, good=0, bad=10,
+            lower_is_better=True, frequency="Weekly", source="manual", score10=7, score100=70),
+    ]
+    assert sc._group_score(rows, "Flow") == pytest.approx(60.0)
 
 
 def test_derived_row_formulas_match_pe_z_score(result):
@@ -87,3 +102,18 @@ def test_score10_clamped_to_0_10(result):
 
 def test_liquidity_band(result):
     assert result.liquidity_band == "15-25k"
+
+
+def test_manual_update_checklist_groups_by_frequency(result):
+    checklist = sc.manual_update_checklist(result.rows)
+    bucketed_rows = {r.row for v in checklist.values() for r in v}
+    assert bucketed_rows <= {r.row for r in result.rows}
+    all_factors = {r.factor for v in checklist.values() for r in v}
+    # Auto-fetched/derived-from-auto indicators must not appear in the manual checklist.
+    for auto_factor in ("RSI (VNIndex, 14d)", "Index / MA50 (ratio) - timing", "20D Avg Liquidity (VND bn)"):
+        assert auto_factor not in all_factors
+    # A known manual, weekly-frequency indicator must appear in the Weekly bucket.
+    weekly_factors = {r.factor for r in checklist["Weekly"]}
+    assert "CoE (%)" in weekly_factors
+    quarterly_factors = {r.factor for r in checklist["Quarterly"]}
+    assert "GDP (%)" in quarterly_factors
